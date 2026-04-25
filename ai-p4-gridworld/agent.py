@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import os
 import pickle
@@ -7,8 +8,8 @@ MOVES = ["N", "E", "S", "W"]
 
 # Directional deltas as (dx, dy)
 MOVE_DELTAS = {
-    "N": (0, -1),
-    "S": (0,  1),
+    "N": (0,  1),   # y increases going north  (y=39 is north wall)
+    "S": (0, -1),   # y decreases going south  (y=0  is south wall)
     "E": (1,  0),
     "W": (-1, 0),
 }
@@ -32,9 +33,9 @@ class GridNavigator:
                  alpha: float = 0.2,
                  gamma: float = 0.95,
                  eps_start: float = 1.0,
-                 eps_floor: float = 0.05,
+                 eps_floor: float = 0.15,
                  eps_floor_exploit: float = 0.01,
-                 eps_decay: float = 0.99):
+                 eps_decay: float = 0.995):
 
         self.world_id = world_id
         self._q_path    = f"qtables/q_world_{world_id}.npy"
@@ -47,6 +48,7 @@ class GridNavigator:
         self._eps_floor_exploit = eps_floor_exploit   # floor once goal is known
         self._eps_decay         = eps_decay
 
+        self._is_continuation = os.path.exists(self._q_path)
         self._q  = self._load_q()
         meta     = self._load_meta()
 
@@ -57,6 +59,15 @@ class GridNavigator:
 
         self.danger_cells: set             = meta.get("danger_cells", set())
         self.goal_cell:    Optional[tuple] = meta.get("goal_cell", None)
+
+        # Visit counts for UCB exploration bonus
+        self._visit_counts: np.ndarray = meta.get("visit_counts", None)
+        if self._visit_counts is None:
+            self._visit_counts = np.zeros((40, 40), dtype=np.int32)
+        self._total_visits: int = int(self._visit_counts.sum())
+
+        # Persisted session counters (total_steps, episode, etc.)
+        self.session_stats: dict = meta.get("session_stats", {})
 
         # Switch to exploit phase immediately if goal already known
         if self.goal_cell is not None:
@@ -73,6 +84,10 @@ class GridNavigator:
     @property
     def mean_epsilon(self) -> float:
         return float(self._cell_eps.mean())
+
+    @property
+    def is_continuation(self) -> bool:
+        return self._is_continuation
 
     # ------------------------------------------------------------------
     # Action selection
@@ -110,6 +125,8 @@ class GridNavigator:
         self._q[x][y][action] += self.alpha * (
             reward + self.gamma * best_next - self._q[x][y][action]
         )
+        self._visit_counts[x][y] += 1
+        self._total_visits += 1
         self._decay_cell(pos)
 
     def record_terminal(self, pos: tuple, action: int, reward: float):
@@ -139,23 +156,29 @@ class GridNavigator:
         np.save(self._q_path, self._q)
         with open(self._meta_path, "wb") as f:
             pickle.dump({
-                "cell_eps":     self._cell_eps,
-                "danger_cells": self.danger_cells,
-                "goal_cell":    self.goal_cell,
+                "cell_eps":      self._cell_eps,
+                "danger_cells":  self.danger_cells,
+                "goal_cell":     self.goal_cell,
+                "visit_counts":  self._visit_counts,
+                "session_stats": self.session_stats,
             }, f)
 
     def load(self, _path=None):
         self._q = self._load_q()
         meta = self._load_meta()
-        self._cell_eps    = meta.get("cell_eps", np.full((40, 40), self._eps_start))
-        self.danger_cells = meta.get("danger_cells", set())
-        self.goal_cell    = meta.get("goal_cell", None)
+        self._cell_eps     = meta.get("cell_eps", np.full((40, 40), self._eps_start))
+        self.danger_cells  = meta.get("danger_cells", set())
+        self.goal_cell     = meta.get("goal_cell", None)
+        self._visit_counts = meta.get("visit_counts", np.zeros((40, 40), dtype=np.int32))
+        self._total_visits = int(self._visit_counts.sum())
+        self.session_stats = meta.get("session_stats", {})
         if self.goal_cell is not None:
             self._lock_exploit_mode()
         print(f"[Load] world={self.world_id} | "
               f"goal={self.goal_cell} | "
               f"dangers={len(self.danger_cells)} | "
-              f"mean_eps={self.mean_epsilon:.3f}")
+              f"mean_eps={self.mean_epsilon:.3f} | "
+              f"total_visits={self._total_visits}")
 
     # ------------------------------------------------------------------
     # Compatibility shims (keep main.py / train.py working unchanged)
@@ -226,6 +249,11 @@ class GridNavigator:
         grown_eps[:ex, :ey] = self._cell_eps
         self._cell_eps = grown_eps
 
+        grown_vc = np.zeros((new_x, new_y), dtype=np.int32)
+        vx, vy = self._visit_counts.shape
+        grown_vc[:vx, :vy] = self._visit_counts
+        self._visit_counts = grown_vc
+
     def _decay_cell(self, pos: tuple):
         x, y = pos
         floor = self._eps_floor_exploit if self.goal_found else self._eps_floor
@@ -253,16 +281,39 @@ class GridNavigator:
         return safe
 
     def _safe_random(self, pos: tuple) -> int:
+        """Random action biased toward less-visited neighbours."""
         safe = self._safe_neighbours(pos)
-        if safe:
-            return int(np.random.choice(safe))
-        return int(np.random.randint(4))
+        if not safe:
+            return int(np.random.randint(4))
+        x, y = pos
+        max_x, max_y, _ = self._q.shape
+        weights = []
+        for a in safe:
+            dx, dy = MOVE_DELTAS[MOVES[a]]
+            nx = min(max(x + dx, 0), max_x - 1)
+            ny = min(max(y + dy, 0), max_y - 1)
+            weights.append(1.0 / (1 + self._visit_counts[nx][ny]))
+        w = np.array(weights, dtype=float)
+        w /= w.sum()
+        return int(np.random.choice(safe, p=w))
 
     def _greedy_action(self, pos: tuple) -> int:
+        """Greedy action; uses UCB exploration bonus during discovery phase."""
         x, y = pos
         safe = self._safe_neighbours(pos)
         if not safe:
             return int(np.argmax(self._q[x][y]))
+        if not self.goal_found:
+            # UCB bonus drives the agent toward unvisited cells
+            log_t = math.log1p(self._total_visits)
+            max_x, max_y, _ = self._q.shape
+            def ucb_score(a):
+                dx, dy = MOVE_DELTAS[MOVES[a]]
+                nx = min(max(x + dx, 0), max_x - 1)
+                ny = min(max(y + dy, 0), max_y - 1)
+                bonus = 2.0 * math.sqrt(log_t / (1 + self._visit_counts[nx][ny]))
+                return self._q[x][y][a] + bonus
+            return max(safe, key=ucb_score)
         return max(safe, key=lambda a: self._q[x][y][a])
 
 

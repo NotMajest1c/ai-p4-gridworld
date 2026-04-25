@@ -1,3 +1,4 @@
+import os
 import time
 from api import enter_world, get_location, move, reset
 from agent import GridNavigator, MOVES as ACTIONS, GOAL_REWARD_THRESHOLD, TRAP_REWARD_THRESHOLD
@@ -53,6 +54,27 @@ def _await_valid_pos(target_world, retries: int = 5) -> tuple:
     return None
 
 
+def _write_vgrid(log_path, navigator, world_id, total_steps, episode,
+                 is_exploit, summary_lines, step_buffer, is_continuation=False):
+    """Overwrite the log file with the current V grid and recent steps."""
+    q = navigator.q_table
+    rows = min(q.shape[0], 40)
+    cols = min(q.shape[1], 40)
+    run_label = "CONTINUED" if is_continuation else "NEW"
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(f"=== World {world_id} | Step {total_steps} | Ep {episode} | "
+                f"Phase: {'EXPLOIT' if is_exploit else 'DISCOVER'} | {run_label} ===\n")
+        for line in summary_lines:
+            f.write(line + "\n")
+        f.write("\nV-VALUE GRID (max Q per cell)  [col = X axis, row = Y axis]:\n")
+        f.write("     " + "".join(f"{c:8}" for c in range(cols)) + "\n")
+        for r in range(rows):
+            f.write(f"{r:4} " + "".join(f"{float(q[r][c].max()):8.2f}" for c in range(cols)) + "\n")
+        f.write("\n--- Recent Steps ---\n")
+        for s in step_buffer:
+            f.write(s + "\n")
+
+
 def manual_mode(world_id):
     if not _enter_world(world_id):
         return
@@ -74,27 +96,63 @@ def auto_mode(world_id):
     navigator = GridNavigator(target)
     navigator.load()
 
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"world_{target}.txt")
+    step_buffer: list = []
+    STEP_BUFFER = 60
+
     pos = _await_valid_pos(target)
     if pos is None:
         print("[Error] Could not get a valid starting position.")
         return
 
+    # ── session continuity ────────────────────────────────────────────
+    is_cont = navigator.is_continuation
+    sess    = navigator.session_stats
+
     # ── counters ──────────────────────────────────────────────────────
-    episode      = 1
-    step         = 0
-    total_steps  = 0
-    total_reward = 0.0
-    recent_rewards: list = []
-    action_tally = {a: 0 for a in ACTIONS}
-    discover_steps = 0
-    exploit_steps  = 0
-    stall_steps    = 0
-    seen_cells: set = {pos}
+    step      = 0
     LOG_EVERY = 20
+    recent_rewards: list = []
+    if is_cont and sess:
+        episode        = sess.get("episode", 1)
+        total_steps    = sess.get("total_steps", 0)
+        total_reward   = sess.get("total_reward", 0.0)
+        discover_steps = sess.get("discover_steps", 0)
+        exploit_steps  = sess.get("exploit_steps", 0)
+        stall_steps    = sess.get("stall_steps", 0)
+        seen_cells     = sess.get("seen_cells", set()) | {pos}
+        action_tally   = sess.get("action_tally", {a: 0 for a in ACTIONS})
+    else:
+        episode        = 1
+        total_steps    = 0
+        total_reward   = 0.0
+        discover_steps = 0
+        exploit_steps  = 0
+        stall_steps    = 0
+        seen_cells     = {pos}
+        action_tally   = {a: 0 for a in ACTIONS}
+
+    def _sync_session():
+        navigator.session_stats.update({
+            "episode":        episode,
+            "total_steps":    total_steps,
+            "total_reward":   total_reward,
+            "discover_steps": discover_steps,
+            "exploit_steps":  exploit_steps,
+            "stall_steps":    stall_steps,
+            "seen_cells":     seen_cells,
+            "action_tally":   action_tally,
+        })
 
     print(f"\n{'='*60}")
     print(f"  World {target}  |  Phase: "
           f"{'EXPLOIT (goal known)' if navigator.goal_found else 'DISCOVER'}")
+    if is_cont and sess:
+        print(f"  [CONTINUED] from step {total_steps} | episode {episode}")
+    else:
+        print(f"  [NEW RUN]")
     print(f"{'='*60}\n")
 
     while True:
@@ -144,6 +202,7 @@ def auto_mode(world_id):
                 print(f"\n:warning:  [Episode {episode}] Episode ended at {pos} "
                       f"| reward={reward:.1f} | run={run_id}")
 
+            _sync_session()
             navigator.save()
 
             # Re-enter and start fresh episode
@@ -179,13 +238,18 @@ def auto_mode(world_id):
 
         navigator.record_transition(pos, action_idx, reward, new_pos)
         new_q = float(navigator.q_table[x][y][action_idx])
+        _sync_session()
         navigator.save()
 
-        print(
+        step_line = (
             f"Run {run_id} | Ep {episode} | Step {step} | "
-            f"{pos} → {new_pos} | {direction} ({phase}) | r={reward:.3f} | "
-            f"ΔQ={td_error:+.4f} | newQ={new_q:.4f}"
+            f"{pos} -> {new_pos} | {direction} ({phase}) | r={reward:.3f} | "
+            f"dQ={td_error:+.4f} | newQ={new_q:.4f}"
         )
+        print(step_line)
+        step_buffer.append(step_line)
+        if len(step_buffer) > STEP_BUFFER:
+            step_buffer.pop(0)
 
         # ── periodic summary ──────────────────────────────────────────
         if total_steps % LOG_EVERY == 0:
@@ -198,24 +262,30 @@ def auto_mode(world_id):
                 key=lambda t: t[1], reverse=True
             )
 
-            print("\n" + "─" * 72)
-            print(
+            summary_lines = [
                 f"Summary @{total_steps} steps | "
                 f"avgR(all)={avg_all:.4f} | avgR(recent)={avg_recent:.4f} | "
-                f"stall={stall_rate:.1%} | cells={len(seen_cells)}"
-            )
-            print(
+                f"stall={stall_rate:.1%} | cells={len(seen_cells)}",
                 f"Phase: {'EXPLOIT' if navigator.goal_found else 'DISCOVER'} | "
                 f"mean_eps={navigator.mean_epsilon:.4f} | "
-                f"dangers={len(navigator.danger_cells)} | goal={navigator.goal_cell}"
-            )
-            print("Moves: " + " | ".join(f"{a}={action_tally[a]}" for a in ACTIONS))
-            print("Top V(s):    " + "  ".join(f"{c}:{v:.3f}" for c, v in ranked[:5]))
-            print("Bottom V(s): " + "  ".join(f"{c}:{v:.3f}" for c, v in ranked[-5:]))
+                f"dangers={len(navigator.danger_cells)} | goal={navigator.goal_cell} | "
+                f"total_visits={navigator._total_visits}",
+                "Moves: " + " | ".join(f"{a}={action_tally[a]}" for a in ACTIONS),
+                "Top V(s):    " + "  ".join(f"{c}:{v:.3f}" for c, v in ranked[:5]),
+                "Bottom V(s): " + "  ".join(f"{c}:{v:.3f}" for c, v in ranked[-5:]),
+            ]
+
+            print("\n" + "─" * 72)
+            for line in summary_lines:
+                print(line)
             print("─" * 72 + "\n")
 
+            _write_vgrid(log_path, navigator, target, total_steps, episode,
+                         navigator.goal_found, summary_lines, step_buffer,
+                         is_continuation=is_cont)
+
         pos = new_pos
-        time.sleep(0.2)
+        time.sleep(2)
 
 
 def main():
