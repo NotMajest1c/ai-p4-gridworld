@@ -72,7 +72,7 @@ class GridNavigator:
         #self._is_continuation = False  
         #self._q = np.zeros_like(self._load_q())     
         #meta = {}
-	self._is_continuation = os.path.exists(self._q_path)
+        self._is_continuation = os.path.exists(self._q_path)
         self._q               = self._load_q()
         meta                  = self._load_meta()
 
